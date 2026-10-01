@@ -20,14 +20,11 @@ import sys
 import bisect
 from pathlib import Path
 
+import numpy as np
 import pygame
 from PIL import Image, ImageSequence
 from PIL import ImagePalette
 from PIL.GifImagePlugin import GifImageFile
-
-# 跨 Pillow 版本兼容的量化参数
-_DITHER_NONE = getattr(getattr(Image, "Dither", None), "NONE", 0)
-_QUANT_FASTOCTREE = getattr(getattr(Image, "Quantize", Image), "FASTOCTREE", 0)
 
 # 进度条点击热区高度（像素），进度条本身在该区域底部
 SEEK_BAND_H = 20
@@ -116,7 +113,27 @@ def _core_to_p_image(core, transp):
     return img.copy()
 
 
-def _save_p_frames(src_path, selected, sel_dur, sel_disposal, loop):
+def _map_rgb_to_global_palette(rgb_img, pal_bytes):
+    """把完整 RGB 合成画面精确映射为指定全局调色板的 P 模式图像。
+
+    合成像素的颜色全部来自原始调色板，因此用打包 RGB 值查表可做到零误差，
+    不经过 Pillow quantize（它在颜色精确存在时仍会引入少量偏差）。
+    """
+    pal = np.frombuffer(pal_bytes, dtype=np.uint8).reshape(-1, 3).astype(int)
+    px = np.asarray(rgb_img, dtype=np.uint8).astype(int)
+
+    lut = np.zeros(1 << 24, dtype=np.int32)          # 32MB，packed RGB -> 索引
+    lut[(pal[:, 0] << 16) | (pal[:, 1] << 8) | pal[:, 2]] = np.arange(len(pal))
+    packed = (px[..., 0] << 16) | (px[..., 1] << 8) | px[..., 2]
+    indices = lut[packed].astype(np.uint8)
+
+    out = Image.fromarray(indices, mode="P")
+    out.putpalette(pal_bytes)
+    return out
+
+
+def _save_p_frames(src_path, selected, sel_dur, sel_disposal, loop,
+                   global_palette=None):
     out = Path(src_path).with_name(Path(src_path).stem + "_split.gif")
     save_kwargs = dict(
         save_all=True,
@@ -125,6 +142,10 @@ def _save_p_frames(src_path, selected, sel_dur, sel_disposal, loop):
         loop=loop,
         optimize=False,
     )
+    if global_palette is not None:
+        # 所有帧共用一个调色板：Pillow 在索引空间生成紧凑增量块，
+        # 结构与原文件一致，各解码器/看图器表现一致。
+        save_kwargs["palette"] = global_palette
     try:
         save_kwargs["disposal"] = sel_disposal
         selected[0].save(out, **save_kwargs)
@@ -149,6 +170,8 @@ def export_segment(src_path, t1, t2):
     try:
         im = Image.open(src_path)
         n_frames = getattr(im, "n_frames", 1)
+        im.seek(0)
+        global_palette = im.palette.palette if im.palette else None
 
         # 在 load_end 入口截获“合成前的原始 P 核心”，随后仍执行原逻辑，
         # 不干扰正常的帧状态流转。
@@ -169,20 +192,14 @@ def export_segment(src_path, t1, t2):
                 dm = im.disposal_method or 0
                 im.load()    # 触发 spy，拿到原始帧核心
                 if t1 <= elapsed < t2:
-                    if not selected and pending["transp"] is not None:
-                        # 首帧是局部帧：单独用完整合成画面作为第一帧，否则子 GIF
-                        # 打开瞬间大部分区域透明（内容要等后续增量帧累积）。
-                        # 关闭 Floyd-Steinberg 抖动，避免弥散光晕，仅这一帧存在
-                        # 轻微的最近色调色板误差。
+                    if not selected:
+                        # 第一帧统一用完整合成画面：保证子 GIF 打开瞬间即为整幅
+                        # 图像（原始帧多为局部增量帧，直接用作首帧会大片透明）。
+                        # 精确映射回原始全局调色板，零误差、无重新量化。
                         comp = im.convert("RGB") if im.mode != "RGB" else im.copy()
-                        frame_img = comp.quantize(
-                            colors=256,
-                            method=_QUANT_FASTOCTREE,
-                            dither=_DITHER_NONE,
-                        )
-                        frame_img.info.pop("transparency", None)
+                        frame_img = _map_rgb_to_global_palette(comp, global_palette)
                     else:
-                        # 后续帧（或本身完整不透明的首帧）：原始索引帧，无损
+                        # 后续帧：原始索引帧，无损
                         frame_img = _core_to_p_image(pending["core"],
                                                      pending["transp"])
                     selected.append(frame_img)
@@ -196,7 +213,7 @@ def export_segment(src_path, t1, t2):
             return None, "该时间区间内没有完整帧（区间太短）"
 
         out = _save_p_frames(src_path, selected, sel_dur, sel_disposal,
-                             im.info.get("loop", 0))
+                             im.info.get("loop", 0), global_palette)
         return out, None
 
     except Exception:
