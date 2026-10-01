@@ -22,6 +22,12 @@ from pathlib import Path
 
 import pygame
 from PIL import Image, ImageSequence
+from PIL import ImagePalette
+from PIL.GifImagePlugin import GifImageFile
+
+# 跨 Pillow 版本兼容的量化参数
+_DITHER_NONE = getattr(getattr(Image, "Dither", None), "NONE", 0)
+_QUANT_FASTOCTREE = getattr(getattr(Image, "Quantize", Image), "FASTOCTREE", 0)
 
 # 进度条点击热区高度（像素），进度条本身在该区域底部
 SEEK_BAND_H = 20
@@ -97,33 +103,26 @@ def decode_gif(path, progress_cb=None):
 
 # ---------------------------------------------------------------- 导出
 
-def export_segment(src_path, t1, t2, durations_meta=None):
-    """导出 [t1, t2) 时间区间内的帧为新 GIF。"""
-    t1, t2 = sorted((t1, t2))
-    if t2 - t1 < 1:
-        return None, "两个时间节点重合，无内容可导出"
+def _core_to_p_image(core, transp):
+    """把 load_end 中截获的原始索引核心包装成独立的 P 模式 Image。"""
+    img = Image.Image()
+    img.im = core
+    img._mode = "P"
+    img._size = core.size
+    img.palette = ImagePalette.ImagePalette("RGB", palette=core.getpalette())
+    img.info = {}
+    if transp is not None:
+        img.info["transparency"] = transp
+    return img.copy()
 
-    im = Image.open(src_path)
-    selected, sel_dur, sel_disposal = [], [], []
-    elapsed = 0
-    for frame in ImageSequence.Iterator(im):
-        if t1 <= elapsed < t2:
-            selected.append(frame.copy())
-            d = frame.info.get("duration", 0) or im.info.get("duration", 100)
-            sel_dur.append(max(d, 1))
-            dm = frame.disposal_method or 0
-            sel_disposal.append(dm if dm in (0, 1, 2, 3) else 0)
-        elapsed += frame.info.get("duration", 0) or im.info.get("duration", 100) or 1
 
-    if not selected:
-        return None, "该时间区间内没有完整帧（区间太短）"
-
+def _save_p_frames(src_path, selected, sel_dur, sel_disposal, loop):
     out = Path(src_path).with_name(Path(src_path).stem + "_split.gif")
     save_kwargs = dict(
         save_all=True,
         append_images=selected[1:],
         duration=sel_dur,
-        loop=im.info.get("loop", 0),
+        loop=loop,
         optimize=False,
     )
     try:
@@ -132,7 +131,96 @@ def export_segment(src_path, t1, t2, durations_meta=None):
     except Exception:
         save_kwargs.pop("disposal", None)
         selected[0].save(out, **save_kwargs)
-    return str(out), None
+    return str(out)
+
+
+def export_segment(src_path, t1, t2):
+    """导出 [t1, t2) 时间区间内的帧为新 GIF。
+
+    直接提取 GIF 中量化前的原始索引帧（每帧保留自己的调色板），再按原
+    帧时长、disposal 重新封装，避免 RGBA→P 重新量化造成的抖动噪点 / 光晕，
+    做到视觉无损。若当前 Pillow 版本不支持该提取方式，则回退到旧路径。
+    """
+    t1, t2 = sorted((t1, t2))
+    if t2 - t1 < 1:
+        return None, "两个时间节点重合，无内容可导出"
+
+    selected, sel_dur, sel_disposal = [], [], []
+    try:
+        im = Image.open(src_path)
+        n_frames = getattr(im, "n_frames", 1)
+
+        # 在 load_end 入口截获“合成前的原始 P 核心”，随后仍执行原逻辑，
+        # 不干扰正常的帧状态流转。
+        pending = {}
+        orig_load_end = GifImageFile.load_end
+
+        def spy_load_end(self):
+            pending["core"] = self.im.copy()
+            pending["transp"] = self._frame_transparency
+            orig_load_end(self)
+
+        GifImageFile.load_end = spy_load_end
+        elapsed = 0.0
+        try:
+            for i in range(n_frames):
+                im.seek(i)
+                d = im.info.get("duration") or 100
+                dm = im.disposal_method or 0
+                im.load()    # 触发 spy，拿到原始帧核心
+                if t1 <= elapsed < t2:
+                    if not selected and pending["transp"] is not None:
+                        # 首帧是局部帧：单独用完整合成画面作为第一帧，否则子 GIF
+                        # 打开瞬间大部分区域透明（内容要等后续增量帧累积）。
+                        # 关闭 Floyd-Steinberg 抖动，避免弥散光晕，仅这一帧存在
+                        # 轻微的最近色调色板误差。
+                        comp = im.convert("RGB") if im.mode != "RGB" else im.copy()
+                        frame_img = comp.quantize(
+                            colors=256,
+                            method=_QUANT_FASTOCTREE,
+                            dither=_DITHER_NONE,
+                        )
+                        frame_img.info.pop("transparency", None)
+                    else:
+                        # 后续帧（或本身完整不透明的首帧）：原始索引帧，无损
+                        frame_img = _core_to_p_image(pending["core"],
+                                                     pending["transp"])
+                    selected.append(frame_img)
+                    sel_dur.append(max(d, 1))
+                    sel_disposal.append(dm if dm in (0, 1, 2, 3) else 0)
+                elapsed += d
+        finally:
+            GifImageFile.load_end = orig_load_end
+
+        if not selected:
+            return None, "该时间区间内没有完整帧（区间太短）"
+
+        out = _save_p_frames(src_path, selected, sel_dur, sel_disposal,
+                             im.info.get("loop", 0))
+        return out, None
+
+    except Exception:
+        # 回退路径：基于合成帧重新编码（可能有轻微重新量化）
+        return _export_segment_fallback(src_path, t1, t2)
+
+
+def _export_segment_fallback(src_path, t1, t2):
+    im = Image.open(src_path)
+    selected, sel_dur, sel_disposal = [], [], []
+    elapsed = 0
+    for frame in ImageSequence.Iterator(im):
+        d = frame.info.get("duration", 0) or im.info.get("duration", 100)
+        if t1 <= elapsed < t2:
+            selected.append(frame.copy())
+            sel_dur.append(max(d, 1))
+            dm = frame.disposal_method or 0
+            sel_disposal.append(dm if dm in (0, 1, 2, 3) else 0)
+        elapsed += d or 1
+    if not selected:
+        return None, "该时间区间内没有完整帧（区间太短）"
+    out = _save_p_frames(src_path, selected, sel_dur, sel_disposal,
+                         im.info.get("loop", 0))
+    return out, None
 
 
 # ---------------------------------------------------------------- UI
