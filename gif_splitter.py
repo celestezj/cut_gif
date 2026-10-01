@@ -7,6 +7,7 @@ GIF 播放器 / 分段截取工具
     P     记录当前播放时刻为一个时间节点（最多 2 个，第 3 次按下无效）
     O     已有 2 个节点时，截取两节点之间的画面并导出为 原名_split.gif
     Esc   清空所有已记录的时间节点
+    鼠标  点击底部进度条任意位置，立即跳转到该时刻并暂停，按空格继续
     Q     退出
 
 用法:
@@ -21,6 +22,9 @@ from pathlib import Path
 
 import pygame
 from PIL import Image, ImageSequence
+
+# 进度条点击热区高度（像素），进度条本身在该区域底部
+SEEK_BAND_H = 20
 
 
 # ---------------------------------------------------------------- 帧解析
@@ -171,7 +175,7 @@ def draw(screen, frame, state, starts, total, size, fonts, flash):
     screen.blit(f_big.render(f"{fmt(pos)}", True, (255, 255, 255)), (10, 6))
     screen.blit(f_small.render(status, True, color), (10, 44))
 
-    hint = "Space:暂停/播放  P:打点  O:导出  Esc:清空  Q:退出"
+    hint = "Space:暂停/播放  P:打点  O:导出  Esc:清空  点击进度条:跳转  Q:退出"
     screen.blit(f_small.render(hint, True, (190, 190, 190)), (size[0] - 362, 10))
 
     # --- 时间节点显示（也画在画面上） ---
@@ -184,19 +188,19 @@ def draw(screen, frame, state, starts, total, size, fonts, flash):
         ready = f"区间长度 {fmt(b - a)}，按 O 导出"
         screen.blit(f_small.render(ready, True, (120, 230, 140)), (size[0] - 362, 34))
 
-    # --- 底部进度条 + 节点刻度 ---
-    bh = 8
+    # --- 底部进度条 + 节点刻度（整条区域均可点击跳转）---
+    bh = 10
     by = size[1] - bh
-    prog = pygame.Surface((size[0], bh), pygame.SRCALPHA)
-    prog.fill((0, 0, 0, 160))
-    screen.blit(prog, (0, by))
+    band = pygame.Surface((size[0], SEEK_BAND_H), pygame.SRCALPHA)
+    band.fill((0, 0, 0, 110))
+    screen.blit(band, (0, size[1] - SEEK_BAND_H))
     pygame.draw.rect(screen, (90, 160, 255),
                      (0, by, int(size[0] * pos / total), bh))
     for i, t in enumerate(markers):
         x = int(size[0] * t / total)
-        pygame.draw.line(screen, (255, 80, 80), (x, by - 14), (x, size[1]), 2)
+        pygame.draw.line(screen, (255, 80, 80), (x, by - 16), (x, size[1]), 2)
         lab = f_small.render(str(i + 1), True, (255, 80, 80))
-        screen.blit(lab, (x - 4, by - 30))
+        screen.blit(lab, (x - 4, by - 32))
 
     if flash:
         surf = f_big.render(flash, True, (255, 230, 120))
@@ -311,6 +315,16 @@ def main():
                     set_flash("已清空所有时间节点")
                 elif ev.key == pygame.K_q:
                     running = False
+            elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                mx, my = ev.pos
+                # 点击底部进度条区域（含进度条上方若干像素，方便点）
+                if my >= size[1] - SEEK_BAND_H:
+                    ratio = max(0.0, min(1.0, mx / size[0]))
+                    target = ratio * total
+                    state["pos"] = target
+                    elapsed_base = target
+                    state["playing"] = False      # 跳转后保持暂停，按空格继续
+                    set_flash(f"跳转 @ {fmt(target)}（已暂停）")
 
         # 播放位置推进 & 循环
         if state["playing"]:
