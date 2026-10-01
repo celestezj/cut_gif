@@ -176,7 +176,8 @@ def draw(screen, frame, state, starts, total, size, fonts, flash):
     screen.blit(f_small.render(status, True, color), (10, 44))
 
     hint = "Space:暂停/播放  P:打点  O:导出  Esc:清空  点击进度条:跳转  Q:退出"
-    screen.blit(f_small.render(hint, True, (190, 190, 190)), (size[0] - 362, 10))
+    hint_surf = f_small.render(hint, True, (190, 190, 190))
+    screen.blit(hint_surf, (size[0] - hint_surf.get_width() - 10, 10))
 
     # --- 时间节点显示（也画在画面上） ---
     if markers:
@@ -186,7 +187,8 @@ def draw(screen, frame, state, starts, total, size, fonts, flash):
     if len(markers) == 2:
         a, b = sorted(markers)
         ready = f"区间长度 {fmt(b - a)}，按 O 导出"
-        screen.blit(f_small.render(ready, True, (120, 230, 140)), (size[0] - 362, 34))
+        ready_surf = f_small.render(ready, True, (120, 230, 140))
+        screen.blit(ready_surf, (size[0] - ready_surf.get_width() - 10, 36))
 
     # --- 底部进度条 + 节点刻度（整条区域均可点击跳转）---
     bh = 10
